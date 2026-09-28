@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .engine import compile_ruleset
+from .snapshot import canonical_content, content_digest
 
 ID_PATTERN_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 
@@ -33,28 +34,8 @@ class InvalidCustomId(ValueError):
 
 
 def ruleset_payload(payload_in: dict[str, Any]) -> dict[str, Any]:
-    """规范化创建/更新请求体。"""
-    return {
-        "name": payload_in["name"],
-        "description": payload_in.get("description") or "",
-        "default_conflict_policy": payload_in.get(
-            "default_conflict_policy", "collect_all"
-        ),
-        "rules": [
-            {
-                "code": r["code"],
-                "name": r.get("name") or r["code"],
-                "description": r.get("description") or "",
-                "priority": r.get("priority", 0),
-                "conflict_group": r.get("conflict_group"),
-                "conflict_policy": r.get("conflict_policy"),
-                "depends_on": list(r.get("depends_on") or []),
-                "condition": r.get("condition") or "",
-                "action": r.get("action"),
-            }
-            for r in payload_in["rules"]
-        ],
-    }
+    """规范化创建/更新请求体（与快照迁移共用同一规范化结构）。"""
+    return canonical_content(payload_in)
 
 
 def snapshot_from_compiled(compiled, version: int) -> dict[str, Any]:
@@ -224,6 +205,98 @@ def latest_version_number(conn: sqlite3.Connection, ruleset_id: str) -> int | No
         "SELECT current_version FROM rulesets WHERE id = ?", (ruleset_id,)
     ).fetchone()
     return None if row is None else row["current_version"]
+
+
+# ---------- 快照迁移 ----------
+
+
+def import_snapshot(
+    conn: sqlite3.Connection, target_id: str, content: dict[str, Any]
+) -> tuple[str, int, str, dict[str, Any]]:
+    """把快照内容导入目标规则集（与包内版本号无关）。
+
+    调用方须已完成格式与摘要核对；本函数先重新编译，编译失败直接抛出
+    （尚未执行任何写操作，配合 get_db 回滚实现原子化）。随后：
+
+    - 目标 id 不存在：创建规则集并写入 v1；
+    - 目标已存在且内容与其任一版本的规范化摘要一致：返回该版本，不写库；
+    - 目标已存在但无相同内容：追加新版本，版本号按目标当前版本 +1。
+
+    返回 ``(ruleset_id, version, action, snapshot)``，action 为
+    ``created`` / ``matched`` / ``appended`` 之一。
+    """
+    if not valid_custom_id(target_id):
+        raise InvalidCustomId("自定义 id 只能包含字母、数字、-、_")
+
+    payload = ruleset_payload(content)
+    # 写库前先重新编译：任何编译错误在此抛出，保证“校验失败不写库”
+    compiled = compile_ruleset(
+        payload["name"],
+        payload["description"],
+        payload["default_conflict_policy"],
+        payload["rules"],
+    )
+    digest = content_digest(payload)
+
+    existing = get_ruleset(conn, target_id)
+    ts = now()
+
+    if existing is None:
+        version = 1
+        snapshot = snapshot_from_compiled(compiled, version)
+        conn.execute(
+            """INSERT INTO rulesets
+               (id, name, description, default_conflict_policy,
+                current_version, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                target_id,
+                compiled.name,
+                compiled.description,
+                compiled.default_conflict_policy,
+                version,
+                ts,
+                ts,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO ruleset_versions
+               (id, ruleset_id, version, snapshot, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (new_id(), target_id, version, json.dumps(snapshot, ensure_ascii=False), ts),
+        )
+        return target_id, version, "created", snapshot
+
+    # 目标已存在：按版本号顺序逐版比较规范化内容摘要
+    for row in list_versions(conn, target_id):
+        stored = get_version(conn, target_id, row["version"])
+        if stored is not None and content_digest(stored) == digest:
+            return target_id, stored["version"], "matched", stored
+
+    # 无相同内容：版本号按目标规则集递增（忽略包内版本号）
+    new_version = existing["current_version"] + 1
+    snapshot = snapshot_from_compiled(compiled, new_version)
+    conn.execute(
+        """INSERT INTO ruleset_versions
+           (id, ruleset_id, version, snapshot, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (new_id(), target_id, new_version, json.dumps(snapshot, ensure_ascii=False), ts),
+    )
+    conn.execute(
+        """UPDATE rulesets
+           SET name=?, description=?, default_conflict_policy=?,
+               current_version=?, updated_at=?
+           WHERE id=?""",
+        (
+            compiled.name,
+            compiled.description,
+            compiled.default_conflict_policy,
+            new_version,
+            ts,
+            target_id,
+        ),
+    )
+    return target_id, new_version, "appended", snapshot
 
 
 # ---------- 决策结果 ----------

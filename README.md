@@ -17,6 +17,7 @@
 │   ├── schemas.py         # Pydantic 请求/响应模型
 │   ├── database.py        # SQLite 连接、建表、初始化
 │   ├── crud.py            # 持久化层（规则集 / 版本 / 决策结果）
+│   ├── snapshot.py        # 快照迁移包：规范化内容摘要（SHA-256）与导入校验
 │   ├── engine/
 │   │   ├── ast_eval.py    # 基于 AST 的安全表达式求值（沙箱）
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
@@ -183,6 +184,8 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}` | 获取规则集元数据 |
 | `GET`  | `/api/rulesets/{id}/versions` | 列出全部版本 |
 | `GET`  | `/api/rulesets/{id}/versions/{version}` | 获取指定版本快照 |
+| `GET`  | `/api/rulesets/{id}/versions/{version}/snapshot` | 导出指定版本为快照迁移包（源标识 + 完整规则 + SHA-256 摘要） |
+| `POST` | `/api/rulesets/{id}/snapshots/import` | 导入快照迁移包：核对摘要并重新编译，创建 v1 / 匹配既有版本 / 追加新版本 |
 | `POST` | `/api/rulesets/{id}/impact` | 静态依赖影响分析（不求值、不落库） |
 | `POST` | `/api/rulesets/{id}/input-footprint` | 静态输入足迹：汇总规则及上游读取的文档路径（不求值、不落库） |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
@@ -615,6 +618,117 @@ curl -i -X POST localhost:8000/api/rulesets -H 'Content-Type: application/json' 
 # {"error": {"code": "CYCLIC_DEPENDENCY", "message": "规则依赖存在循环：a -> b -> a", "cycle": ["a","b","a"]}}
 ```
 
+### 规则集快照迁移
+
+`GET /api/rulesets/{id}/versions/{version}/snapshot` 把指定**不可变版本**导出为
+一个自描述的 JSON 迁移包，`POST /api/rulesets/{id}/snapshots/import` 再把它
+导入任意环境的目标规则集。包结构：
+
+| 字段 | 说明 |
+| --- | --- |
+| `format` / `format_version` | 固定为 `ruleset-snapshot` / `1.0`，用于格式识别 |
+| `exported_at` | 导出时间（UTC 秒级），仅作记录 |
+| `source` | **源规则集标识**：`ruleset_id`、`version`、`version_id`、`created_at`，仅作来源记录 |
+| `ruleset` | **完整规则定义**：`name` / `description` / `default_conflict_policy` / 全部 `rules` |
+| `content` | **规范化内容摘要**：`digest_algorithm`（`sha256`）与 `digest` |
+
+摘要对规范化后的规则集内容做**键排序、无空白的 UTF-8 JSON** 后取 SHA-256。
+源 ID、版本号、时间戳等来源信息**不参与摘要**，因此同一份内容在任意目标上
+摘要一致；字段缺省值与显式等价写法（如未填 `description` 与 `""`）规范化后
+也视为相同内容。
+
+导出示例：
+
+```bash
+curl -s localhost:8000/api/rulesets/demo-promotions/versions/1/snapshot \
+  -o demo-v1.snapshot.json
+python3 -m json.tool demo-v1.snapshot.json
+```
+
+导出包示例（有省略）：
+
+```json
+{
+  "format": "ruleset-snapshot",
+  "format_version": "1.0",
+  "exported_at": "2026-09-28T12:00:00+00:00",
+  "source": {
+    "ruleset_id": "demo-promotions",
+    "version": 1,
+    "version_id": "78bc55b1db5246a4ba83ee2f9960629",
+    "created_at": "2026-09-28T12:00:00+00:00"
+  },
+  "ruleset": {
+    "name": "促销规则演示",
+    "description": "VIP、大额订单、优惠券、包邮、人工审核示例。",
+    "default_conflict_policy": "collect_all",
+    "rules": [
+      {"code": "is_vip", "name": "VIP 客户", "priority": 0,
+       "conflict_group": null, "conflict_policy": null,
+       "depends_on": [], "condition": "doc[\"customer\"][\"vip\"] == true",
+       "action": "{\"vip\": true}"}
+    ]
+  },
+  "content": {
+    "digest_algorithm": "sha256",
+    "digest": "a3f5…（64 位十六进制）"
+  }
+}
+```
+
+导入语义（路径中的 `{id}` 是**目标规则集 ID**，与源 ID、包内版本号无关）：
+
+1. **核对摘要**：重新计算 `ruleset` 段的规范化摘要，与 `content.digest`
+   不一致则返回 **400** `SNAPSHOT_DIGEST_MISMATCH`（包损坏或被篡改）；
+2. **重新编译**：对包内规则执行与创建接口相同的全部静态校验（规则编码、
+   表达式、未知依赖、循环依赖、冲突策略等），失败返回对应编译错误码
+   （如 `CYCLIC_DEPENDENCY`、`UNKNOWN_DEPENDENCY`），**校验失败不写库**；
+3. 按目标规则集现状落位：
+   - 目标 ID **不存在** → 创建规则集并写入 **v1**（`action: created`）；
+   - 目标已存在且内容与其**任一版本**的规范化摘要一致 → 返回该版本、
+     **不写库**（`action: matched`）；
+   - 目标已存在但无相同内容 → **版本号按目标当前版本 +1 追加**
+     （`action: appended`），**不采用包内的 `source.version`**。
+
+整个导入在单个数据库事务内完成，任何错误都回滚；响应回显 `ruleset_id`、
+最终 `version`、`action` 与该版本的完整快照（含重新编译得到的
+`evaluation_order` / `referenced_rules`）。
+
+导入示例（迁移到新 ID → created；重复导入同一包 → matched）：
+
+```bash
+# 首次导入：目标不存在，创建 v1
+curl -s -X POST localhost:8000/api/rulesets/promotions-prod/snapshots/import \
+  -H 'Content-Type: application/json' \
+  --data-binary @demo-v1.snapshot.json | python3 -m json.tool
+# {
+#   "ruleset_id": "promotions-prod",
+#   "version": 1,
+#   "action": "created",
+#   "snapshot": { "version": 1, "evaluation_order": ["is_vip", ...], "rules": [...] }
+# }
+
+# 再次导入同一内容：与 v1 一致，直接返回既有版本，不新增
+curl -s -X POST localhost:8000/api/rulesets/promotions-prod/snapshots/import \
+  -H 'Content-Type: application/json' \
+  --data-binary @demo-v1.snapshot.json
+# {"ruleset_id": "promotions-prod", "version": 1, "action": "matched", "snapshot": {...}}
+```
+
+目标已存在且内容不同（或源是一个全新版本）时，导入按目标版本线追加：
+例如目标当前为 v2，导入包内容不与 v1/v2 任一相同，则返回
+`{"version": 3, "action": "appended", ...}`，与包内 `source.version` 无关。
+
+错误情况：
+
+- 摘要不一致 → **400** `SNAPSHOT_DIGEST_MISMATCH`
+  （`details` 含 `expected` / `actual`，不创建任何规则集或版本）；
+- 格式 / 格式版本不支持 → **400** `UNSUPPORTED_SNAPSHOT_FORMAT`；
+  摘要算法不支持 → **400** `UNSUPPORTED_DIGEST_ALGORITHM`；
+- 重新编译失败 → **400** 对应编译错误码，事务回滚，目标版本线不变；
+- 目标 ID 非法（含字母、数字、`-`、`_` 以外字符）→ **400** `INVALID_ID`；
+- 请求体不符合包结构（缺字段等）→ **422**。
+
 ### 静态依赖影响分析
 
 `POST /api/rulesets/{id}/impact` 用于在**改动规则前评估影响面**：提交
@@ -792,5 +906,7 @@ pytest -q
 静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422）、
 跨版本预演（JSON 路径差异归并/空差异/冲突胜出方变化/求值失败单侧隔离/不落库/404 与 422）、
 多文档覆盖分析（rule/group/field 覆盖单元/命中与未命中统计/冲突场景去重与观察下标/
-确定性贪心代表选择/失败项隔离且不参与选择/不落库/404 与 422），
+确定性贪心代表选择/失败项隔离且不参与选择/不落库/404 与 422）、
+快照迁移（导出包结构与摘要/规范化等价匹配/created·matched·appended 落位/
+版本号按目标递增/摘要篡改与重编译失败回滚不写库/400 与 404），
 以及完整 HTTP 接口。

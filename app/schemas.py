@@ -465,3 +465,47 @@ class ErrorResponse(BaseModel):
     code: str
     message: str
     details: dict[str, Any] = {}
+
+
+# ---------- 规则集快照迁移 ----------
+
+
+class SnapshotRulesetIn(BaseModel):
+    """导出包中的规则集内容段：与 RulesetCreate 去掉 id 后的完整定义一致。"""
+
+    name: str = Field(..., min_length=1)
+    description: str = ""
+    default_conflict_policy: ConflictPolicy = "collect_all"
+    rules: list[RuleIn] = Field(..., min_length=1)
+
+
+class SnapshotSource(BaseModel):
+    ruleset_id: str
+    version: int = Field(..., ge=1)
+    version_id: str | None = None
+    created_at: str | None = None
+
+
+class SnapshotDigest(BaseModel):
+    digest_algorithm: Literal["sha256"]
+    digest: str = Field(..., min_length=1)
+
+
+class RulesetSnapshotPackage(BaseModel):
+    format: Literal["ruleset-snapshot"]
+    format_version: Literal["1.0"]
+    exported_at: str
+    source: SnapshotSource
+    ruleset: SnapshotRulesetIn
+    content: SnapshotDigest
+
+
+class RulesetSnapshotImportOut(BaseModel):
+    ruleset_id: str
+    version: int = Field(..., description="导入后该内容在目标规则集上的版本号")
+    action: Literal["created", "matched", "appended"] = Field(
+        ...,
+        description="created=目标不存在已创建 v1；matched=与既有版本内容一致，未写库；"
+        "appended=目标已存在但无相同内容，追加了新版本",
+    )
+    snapshot: RulesetVersionOut

@@ -45,10 +45,13 @@ from .schemas import (
     RecomputeRequest,
     RulesetCreate,
     RulesetMeta,
+    RulesetSnapshotImportOut,
+    RulesetSnapshotPackage,
     RulesetUpdate,
     RulesetVersionOut,
 )
 from .seed import seed_demo
+from .snapshot import SnapshotError, build_package, verify_package
 
 
 @asynccontextmanager
@@ -296,6 +299,75 @@ def get_version(
             return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
         return _error("VERSION_NOT_FOUND", f"版本 {version} 不存在", 404)
     return _version_out(snapshot)
+
+
+# ---------- 规则集快照迁移 ----------
+
+
+@app.get(
+    "/api/rulesets/{ruleset_id}/versions/{version}/snapshot",
+    response_model=RulesetSnapshotPackage,
+    tags=["migration"],
+    responses={404: {"model": ErrorResponse}},
+)
+def export_snapshot(
+    ruleset_id: str,
+    version: int,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """导出指定版本为快照迁移包。
+
+    包含源规则集标识（source）、完整规则集内容（ruleset）与规范化内容
+    摘要（content，SHA-256）；包内版本号仅作来源记录，导入时不使用。
+    """
+    snapshot = crud.get_version(conn, ruleset_id, version)
+    if snapshot is None:
+        if crud.get_ruleset(conn, ruleset_id) is None:
+            return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+        return _error("VERSION_NOT_FOUND", f"版本 {version} 不存在", 404)
+    return build_package(snapshot, crud.now())
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/snapshots/import",
+    response_model=RulesetSnapshotImportOut,
+    tags=["migration"],
+    responses={400: {"model": ErrorResponse}},
+)
+def import_snapshot(
+    ruleset_id: str,
+    package: RulesetSnapshotPackage,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """导入快照迁移包到目标规则集 ``ruleset_id``（与源 ID、包内版本号无关）。
+
+    流程：先核对 content 摘要，再重新编译；任何一步失败都在写库前中止，
+    由 get_db 回滚，已有数据不受影响。校验通过后按目标规则集现状处理：
+    目标 ID 不存在则创建 v1（created）；已存在且内容与任一版本的规范化
+    摘要一致则返回该版本、不写库（matched）；否则按目标当前版本 +1
+    追加新版本（appended）。
+    """
+    try:
+        # 摘要核对失败 / 格式不支持：尚未写库
+        content = verify_package(package.model_dump())
+        # 重新编译发生在 INSERT 之前，编译错误同样不会留下任何数据
+        target_id, version, action, _snapshot = crud.import_snapshot(
+            conn, ruleset_id, content
+        )
+    except SnapshotError as exc:
+        return _error(exc.code, exc.message, 400, details=exc.details)
+    except RulesetCompileError as exc:
+        return _error(exc.code, exc.message, 400, details=exc.details)
+    except crud.InvalidCustomId as exc:
+        return _error("INVALID_ID", str(exc), 400)
+
+    snapshot = crud.get_version(conn, target_id, version)
+    return {
+        "ruleset_id": target_id,
+        "version": version,
+        "action": action,
+        "snapshot": _version_out(snapshot),
+    }
 
 
 # ---------- 静态影响分析 ----------
