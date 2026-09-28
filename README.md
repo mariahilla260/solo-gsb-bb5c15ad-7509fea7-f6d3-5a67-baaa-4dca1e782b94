@@ -183,6 +183,8 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}` | 获取规则集元数据 |
 | `GET`  | `/api/rulesets/{id}/versions` | 列出全部版本 |
 | `GET`  | `/api/rulesets/{id}/versions/{version}` | 获取指定版本快照 |
+| `GET`  | `/api/rulesets/{id}/versions/{version}/snapshot` | 导出该版本为快照迁移 JSON 包（源标识 + 完整定义 + 内容摘要） |
+| `POST` | `/api/rulesets/{id}/snapshot-import` | 导入快照迁移包：核对摘要并重编译，幂等创建/匹配/追加版本 |
 | `POST` | `/api/rulesets/{id}/impact` | 静态依赖影响分析（不求值、不落库） |
 | `POST` | `/api/rulesets/{id}/input-footprint` | 静态输入足迹：汇总规则及上游读取的文档路径（不求值、不落库） |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
@@ -779,6 +781,133 @@ curl -i -X POST localhost:8000/api/rulesets/r/input-footprint \
 #               "index": "\"k\" + \"x\"", "expression": "doc[\"k\" + \"x\"] == 1"}}}
 ```
 
+### 规则集快照迁移（导出 / 导入）
+
+快照迁移用于把某个版本搬到另一套环境（或另一个规则集 ID）：导出得到一个
+**自描述 JSON 包**，导入时先核对内容摘要、再重新编译，全部通过后才落库。
+
+`GET /api/rulesets/{id}/versions/{version}/snapshot` 导出指定版本，包结构：
+
+| 字段 | 说明 |
+| --- | --- |
+| `format` | 固定为 `"ruleset-snapshot"`，标识包类型 |
+| `format_version` | 包格式版本，当前为 `1` |
+| `source` | 源规则集标识 `{ruleset_id, version}`，仅用于溯源 |
+| `exported_at` | 导出时间（UTC ISO-8601），不参与摘要 |
+| `digest` | 规范化内容摘要 `{algorithm: "sha256", value}` |
+| `ruleset` | 完整规则集定义：`name` / `description` / `default_conflict_policy` / `rules` |
+
+摘要对 `ruleset` 规范化后的内容计算 sha256：仅含参与规则语义的字段
+（规则按提交顺序、`depends_on` 去重保序、缺省字段补齐），以
+`sort_keys`、无多余空白、UTF-8、非 ASCII 不转义的 JSON 序列化。
+同一内容无论经创建、更新、导入还是从已存储快照重算，摘要都一致。
+
+导出示例：
+
+```bash
+curl -s localhost:8000/api/rulesets/demo-promotions/versions/1/snapshot \
+  -o snapshot.json
+python3 -m json.tool snapshot.json
+```
+
+响应示例（规则字段有省略）：
+
+```json
+{
+  "format": "ruleset-snapshot",
+  "format_version": 1,
+  "source": {"ruleset_id": "demo-promotions", "version": 1},
+  "exported_at": "2026-09-28T12:00:00+00:00",
+  "digest": {
+    "algorithm": "sha256",
+    "value": "9f2c8e…（64 位十六进制）"
+  },
+  "ruleset": {
+    "name": "促销规则演示",
+    "description": "VIP、大额订单、优惠券、包邮、人工审核示例。……",
+    "default_conflict_policy": "collect_all",
+    "rules": [
+      {
+        "code": "is_vip",
+        "name": "VIP 客户",
+        "description": "",
+        "priority": 0,
+        "conflict_group": null,
+        "conflict_policy": null,
+        "depends_on": [],
+        "condition": "doc[\"customer\"][\"vip\"] == true",
+        "action": "{\"vip\": true}"
+      }
+    ]
+  }
+}
+```
+
+`POST /api/rulesets/{id}/snapshot-import` 把快照包导入到路径指定的
+**目标规则集 ID**（允许与 `source.ruleset_id` 不同；迁移不依赖源 ID）。
+处理流程：
+
+1. 校验 `format` / `format_version` 与摘要算法（仅 sha256）；
+2. 对包内 `ruleset` 重新规范化并计算 sha256，与 `digest.value` 不符
+   （包被篡改或传输损坏）返回 **400** `DIGEST_MISMATCH`；
+3. 按包内完整规则定义**重新编译**——重复编码、未知依赖、隐式引用、
+   循环依赖、冲突策略冲突等静态校验全部重跑，任一失败返回 **400**
+   对应编译错误码；
+4. 落库规则（整个写入在单事务内原子完成）：
+   - 目标 ID **不存在** → 创建 v1，`action="created"`（HTTP **201**）；
+   - 目标已存在且内容与其**任一历史版本**摘要一致 → 幂等返回该版本，
+     `action="matched"`（HTTP 200，**不产生新版本**）；
+   - 否则 `action="appended"`（HTTP 200），版本号为**目标规则集**
+     `current_version + 1`。
+
+> 版本号始终按**目标规则集**递增，**不采用**包内 `source.version`；
+> 因此把源端 v3 导入一个空目标只会得到 v1。摘要核对或编译失败时
+> **不写库**，目标规则集保持原状。
+
+导入示例：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/promotions-copy/snapshot-import \
+  -H 'Content-Type: application/json' \
+  --data @snapshot.json | python3 -m json.tool
+```
+
+首次导入到不存在的目标，返回 **201**（再次导入同一包返回 200
+`matched`）：
+
+```json
+{
+  "action": "created",
+  "ruleset_id": "promotions-copy",
+  "version": 1,
+  "source": {"ruleset_id": "demo-promotions", "version": 1},
+  "digest": {"algorithm": "sha256", "value": "9f2c8e…"},
+  "snapshot": {
+    "id": "…",
+    "ruleset_id": "promotions-copy",
+    "version": 1,
+    "name": "促销规则演示",
+    "default_conflict_policy": "collect_all",
+    "evaluation_order": ["is_vip", "large_order", "vip_discount",
+                         "coupon_save10", "coupon_save20",
+                         "free_shipping", "manual_review"],
+    "rules": [ … ],
+    "created_at": "2026-09-28T12:01:00+00:00"
+  }
+}
+```
+
+错误情况：
+
+| 场景 | HTTP | 错误码 |
+| --- | --- | --- |
+| 导出时规则集 / 版本不存在 | 404 | `NOT_FOUND` / `VERSION_NOT_FOUND` |
+| 目标 ID 含非法字符 | 400 | `INVALID_ID` |
+| 摘要核对失败（内容被改动 / 损坏） | 400 | `DIGEST_MISMATCH` |
+| 摘要算法不受支持（非 sha256） | 422 | Pydantic 校验错误 |
+| 重新编译失败（循环依赖等） | 400 | 对应编译错误码，如 `CYCLIC_DEPENDENCY` |
+| 包缺字段 / `format` 不符 / 规则为空 | 422 | Pydantic 校验错误 |
+
 ## 测试
 
 ```bash
@@ -792,5 +921,7 @@ pytest -q
 静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422）、
 跨版本预演（JSON 路径差异归并/空差异/冲突胜出方变化/求值失败单侧隔离/不落库/404 与 422）、
 多文档覆盖分析（rule/group/field 覆盖单元/命中与未命中统计/冲突场景去重与观察下标/
-确定性贪心代表选择/失败项隔离且不参与选择/不落库/404 与 422），
+确定性贪心代表选择/失败项隔离且不参与选择/不落库/404 与 422）、
+规则集快照迁移（导出包结构/规范化摘要/导入 created·matched·appended 幂等分支/
+版本号按目标递增不采用包内版本/摘要不符与重编译失败不写库/400 与 404），
 以及完整 HTTP 接口。

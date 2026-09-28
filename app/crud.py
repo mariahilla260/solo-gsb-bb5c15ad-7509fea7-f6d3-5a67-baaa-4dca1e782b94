@@ -1,7 +1,9 @@
-"""持久化层：规则集、不可变版本快照、决策结果。"""
+"""持久化层：规则集、不可变版本快照、决策结果、快照迁移。"""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import sqlite3
 import uuid
@@ -11,6 +13,11 @@ from typing import Any
 from .engine import compile_ruleset
 
 ID_PATTERN_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+
+# 快照包格式
+SNAPSHOT_FORMAT = "ruleset-snapshot"
+SNAPSHOT_FORMAT_VERSION = 1
+SNAPSHOT_DIGEST_ALGORITHM = "sha256"
 
 
 def now() -> str:
@@ -224,6 +231,227 @@ def latest_version_number(conn: sqlite3.Connection, ruleset_id: str) -> int | No
         "SELECT current_version FROM rulesets WHERE id = ?", (ruleset_id,)
     ).fetchone()
     return None if row is None else row["current_version"]
+
+
+# ---------- 规则集快照迁移（导出 / 导入） ----------
+
+
+class SnapshotPackageError(ValueError):
+    """快照包不符合迁移格式或摘要核对失败；不写库。"""
+
+    def __init__(self, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
+def canonical_ruleset_content(ruleset_in: dict[str, Any]) -> dict[str, Any]:
+    """把规则集定义规范化为稳定结构（供摘要与重编译共用）。
+
+    仅包含参与规则语义的字段：name / description /
+    default_conflict_policy / rules；规则按提交顺序保留，depends_on
+    去重保序。与创建/更新接口走同一规范化逻辑，保证“同一内容无论来源
+    （创建、更新、导入、已存储快照）”摘要一致。
+    """
+    return ruleset_payload(ruleset_in)
+
+
+def content_digest(content: dict[str, Any]) -> str:
+    """规范化 JSON（sort_keys、无多余空白、UTF-8、不转义非 ASCII）的 sha256。"""
+    canonical = json.dumps(
+        content, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def snapshot_content(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """从已存储版本快照中抽出参与摘要的规则集定义。"""
+    return {
+        "name": snapshot["name"],
+        "description": snapshot.get("description", ""),
+        "default_conflict_policy": snapshot["default_conflict_policy"],
+        "rules": [
+            {
+                "code": r["code"],
+                "name": r.get("name", r["code"]),
+                "description": r.get("description", ""),
+                "priority": r.get("priority", 0),
+                "conflict_group": r.get("conflict_group"),
+                "conflict_policy": r.get("conflict_policy"),
+                "depends_on": list(r.get("depends_on") or []),
+                "condition": r.get("condition", ""),
+                "action": r.get("action"),
+            }
+            for r in snapshot["rules"]
+        ],
+    }
+
+
+def build_snapshot_package(
+    snapshot: dict[str, Any], source_ruleset_id: str
+) -> dict[str, Any]:
+    """把指定版本快照打包为含源标识、完整定义与内容摘要的 JSON 包。"""
+    content = canonical_ruleset_content(snapshot_content(snapshot))
+    return {
+        "format": SNAPSHOT_FORMAT,
+        "format_version": SNAPSHOT_FORMAT_VERSION,
+        "source": {
+            "ruleset_id": source_ruleset_id,
+            "version": snapshot["version"],
+        },
+        "exported_at": now(),
+        "digest": {
+            "algorithm": SNAPSHOT_DIGEST_ALGORITHM,
+            "value": content_digest(content),
+        },
+        "ruleset": {
+            "name": content["name"],
+            "description": content["description"],
+            "default_conflict_policy": content["default_conflict_policy"],
+            "rules": content["rules"],
+        },
+    }
+
+
+def import_snapshot(
+    conn: sqlite3.Connection, target_ruleset_id: str, package: dict[str, Any]
+) -> tuple[str, int, dict[str, Any]]:
+    """核对摘要 → 重编译 → 幂等导入快照包。
+
+    返回 (action, version, snapshot)，action 为
+    created（目标不存在，创建 v1）/ matched（已有内容一致版本）/
+    appended（追加新版本）。任何校验失败都抛异常，且不写库。
+
+    版本号始终按目标规则集递增（current_version+1，新建为 1），
+    不采用包内 source.version。整个过程在单连接事务内完成，由上层
+    get_db 统一提交/回滚，保证原子化。
+    """
+    # 1) 包格式校验（Pydantic 已保证字段存在，这里做防御性兜底）
+    if package.get("format") != SNAPSHOT_FORMAT:
+        raise SnapshotPackageError(
+            "INVALID_SNAPSHOT_FORMAT",
+            f"快照包 format 必须为 {SNAPSHOT_FORMAT!r}",
+            {"format": package.get("format")},
+        )
+    if package.get("format_version") != SNAPSHOT_FORMAT_VERSION:
+        raise SnapshotPackageError(
+            "UNSUPPORTED_SNAPSHOT_VERSION",
+            f"不支持的快照包格式版本：{package.get('format_version')!r}",
+            {"format_version": package.get("format_version")},
+        )
+
+    digest_info = package.get("digest") or {}
+    algorithm = digest_info.get("algorithm")
+    provided = digest_info.get("value")
+    if algorithm != SNAPSHOT_DIGEST_ALGORITHM:
+        raise SnapshotPackageError(
+            "UNSUPPORTED_DIGEST_ALGORITHM",
+            f"仅支持 {SNAPSHOT_DIGEST_ALGORITHM} 摘要，收到：{algorithm!r}",
+            {"algorithm": algorithm},
+        )
+    if not isinstance(provided, str) or not provided.strip():
+        raise SnapshotPackageError(
+            "INVALID_SNAPSHOT_DIGEST", "快照包缺少内容摘要 digest.value"
+        )
+
+    ruleset_body = package.get("ruleset")
+    if not isinstance(ruleset_body, dict):
+        raise SnapshotPackageError(
+            "INVALID_SNAPSHOT_RULESET", "快照包缺少 ruleset 规则集定义"
+        )
+
+    # 2) 规范化内容并核对摘要；不符则拒绝（防篡改/传输损坏）
+    content = canonical_ruleset_content(ruleset_body)
+    actual = content_digest(content)
+    if not hmac.compare_digest(actual, provided.strip().lower()):
+        raise SnapshotPackageError(
+            "DIGEST_MISMATCH",
+            "快照内容摘要核对失败：包内规则定义与摘要不一致，已拒绝导入",
+            {"expected": provided, "actual": actual},
+        )
+
+    # 3) 重新编译（全部静态校验：重复编码、未知依赖、循环依赖、策略冲突等）
+    compiled = compile_ruleset(
+        content["name"],
+        content["description"],
+        content["default_conflict_policy"],
+        content["rules"],
+    )
+
+    # 4) 加写锁后原子决策：复核目标存在性与全部历史版本的内容摘要，
+    #    杜绝“检查—写入”之间被并发提交插空。整个写入在单事务内完成，
+    #    由上层 get_db 统一提交/回滚。
+    conn.execute("BEGIN IMMEDIATE")
+    existing = get_ruleset(conn, target_ruleset_id)
+    if existing is not None:
+        rows = conn.execute(
+            "SELECT version, snapshot FROM ruleset_versions WHERE ruleset_id = ?",
+            (target_ruleset_id,),
+        ).fetchall()
+        for row in rows:
+            stored = json.loads(row["snapshot"])
+            if content_digest(canonical_ruleset_content(snapshot_content(stored))) == actual:
+                matched = get_version(conn, target_ruleset_id, row["version"])
+                return "matched", row["version"], matched
+
+    ts = now()
+    if existing is None:
+        # 目标 ID 不存在 → 创建 v1
+        version = 1
+        snapshot = snapshot_from_compiled(compiled, version)
+        conn.execute(
+            """INSERT INTO rulesets
+               (id, name, description, default_conflict_policy,
+                current_version, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                target_ruleset_id,
+                compiled.name,
+                compiled.description,
+                compiled.default_conflict_policy,
+                version,
+                ts,
+                ts,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO ruleset_versions
+               (id, ruleset_id, version, snapshot, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (new_id(), target_ruleset_id, version,
+             json.dumps(snapshot, ensure_ascii=False), ts),
+        )
+        action = "created"
+    else:
+        # 内容与任一版本都不一致 → 按目标规则集 current_version+1 追加
+        version = existing["current_version"] + 1
+        snapshot = snapshot_from_compiled(compiled, version)
+        conn.execute(
+            """INSERT INTO ruleset_versions
+               (id, ruleset_id, version, snapshot, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (new_id(), target_ruleset_id, version,
+             json.dumps(snapshot, ensure_ascii=False), ts),
+        )
+        conn.execute(
+            """UPDATE rulesets
+               SET name=?, description=?, default_conflict_policy=?,
+                   current_version=?, updated_at=?
+               WHERE id=?""",
+            (
+                compiled.name,
+                compiled.description,
+                compiled.default_conflict_policy,
+                version,
+                ts,
+                target_ruleset_id,
+            ),
+        )
+        action = "appended"
+
+    stored = get_version(conn, target_ruleset_id, version)
+    return action, version, stored
 
 
 # ---------- 决策结果 ----------

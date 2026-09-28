@@ -71,6 +71,65 @@ class RulesetVersionOut(BaseModel):
     created_at: str
 
 
+# ---------- 规则集快照迁移（导出 / 导入） ----------
+
+
+class SnapshotSource(BaseModel):
+    ruleset_id: str = Field(..., description="导出时的源规则集 ID（仅作溯源，导入时不使用）")
+    version: int = Field(
+        ..., ge=1, description="导出时的源版本号（仅作溯源，导入时不沿用）"
+    )
+
+
+class SnapshotDigest(BaseModel):
+    algorithm: Literal["sha256"] = Field(
+        "sha256", description="内容摘要算法；当前仅支持 sha256"
+    )
+    value: str = Field(
+        ..., min_length=1, description="规范化规则集内容的十六进制摘要"
+    )
+
+
+class SnapshotRulesetBody(BaseModel):
+    name: str = Field(..., min_length=1)
+    description: str = ""
+    default_conflict_policy: ConflictPolicy = "collect_all"
+    rules: list[RuleIn] = Field(..., min_length=1)
+
+
+class RulesetSnapshotPackage(BaseModel):
+    format: Literal["ruleset-snapshot"] = Field(
+        ..., description="固定标识 ruleset-snapshot"
+    )
+    format_version: Literal[1] = Field(1, description="快照包格式版本，当前为 1")
+    source: SnapshotSource = Field(..., description="源规则集标识（溯源用）")
+    exported_at: str | None = Field(
+        None, description="导出时间（UTC ISO-8601）；不参与摘要，可为空"
+    )
+    digest: SnapshotDigest = Field(..., description="规范化内容摘要")
+    ruleset: SnapshotRulesetBody = Field(
+        ..., description="完整规则集定义（元数据 + 全部规则）"
+    )
+
+
+class SnapshotImportOut(BaseModel):
+    action: Literal["created", "matched", "appended"] = Field(
+        ...,
+        description=(
+            "created=目标不存在，已创建 v1；"
+            "matched=目标已有内容一致的版本，直接返回该版本；"
+            "appended=内容为新版本，已按目标规则集递增追加"
+        ),
+    )
+    ruleset_id: str
+    version: int = Field(..., description="目标规则集中实际对应的版本号")
+    source: SnapshotSource = Field(..., description="回显包内源规则集标识")
+    digest: SnapshotDigest = Field(..., description="回显核对通过的内容摘要")
+    snapshot: RulesetVersionOut = Field(
+        ..., description="目标版本的完整快照（结构与 GET 指定版本一致）"
+    )
+
+
 class EvaluateRequest(BaseModel):
     document: Any = Field(default_factory=dict)
 

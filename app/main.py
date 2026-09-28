@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import crud
@@ -45,8 +45,10 @@ from .schemas import (
     RecomputeRequest,
     RulesetCreate,
     RulesetMeta,
+    RulesetSnapshotPackage,
     RulesetUpdate,
     RulesetVersionOut,
+    SnapshotImportOut,
 )
 from .seed import seed_demo
 
@@ -296,6 +298,88 @@ def get_version(
             return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
         return _error("VERSION_NOT_FOUND", f"版本 {version} 不存在", 404)
     return _version_out(snapshot)
+
+
+# ---------- 规则集快照迁移（导出 / 导入） ----------
+
+
+@app.get(
+    "/api/rulesets/{ruleset_id}/versions/{version}/snapshot",
+    response_model=RulesetSnapshotPackage,
+    tags=["ruleset-migration"],
+    responses={404: {"model": ErrorResponse}},
+)
+def export_snapshot(
+    ruleset_id: str,
+    version: int,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """导出指定版本为快照迁移包：源规则集标识 + 完整规则定义 + 规范化内容摘要。
+
+    包为自描述 JSON：``format`` / ``format_version`` 标识包格式，
+    ``source`` 记录导出时的规则集 ID 与版本（仅溯源），``digest`` 为对
+    ruleset 规范化内容的 sha256 摘要，``exported_at`` 不参与摘要。
+    规则集或版本不存在返回 404。
+    """
+    snapshot = crud.get_version(conn, ruleset_id, version)
+    if snapshot is None:
+        if crud.get_ruleset(conn, ruleset_id) is None:
+            return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+        return _error("VERSION_NOT_FOUND", f"版本 {version} 不存在", 404)
+    return crud.build_snapshot_package(snapshot, ruleset_id)
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/snapshot-import",
+    response_model=SnapshotImportOut,
+    tags=["ruleset-migration"],
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+def import_snapshot(
+    ruleset_id: str,
+    package: RulesetSnapshotPackage,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """导入快照迁移包：核对摘要、重新编译，幂等落地到目标规则集。
+
+    流程（任何一步失败均不写库）：
+
+    1. 校验包格式与摘要算法，重算规范化内容的 sha256，与包内摘要不符
+       返回 400 ``DIGEST_MISMATCH``；
+    2. 按包内完整规则定义**重新编译**（重复编码、未知依赖、循环依赖、
+       冲突策略冲突等静态校验），失败返回 400 对应编译错误码；
+    3. 目标 ID 不存在 → 创建 v1（``action=created``，HTTP 201）；
+       目标已存在且内容与**任一版本**一致 → 幂等返回该版本
+       （``action=matched``，HTTP 200，不产生新版本）；
+       否则按**目标规则集** current_version+1 追加新版本
+       （``action=appended``，HTTP 200）——版本号始终按目标规则集
+       递增，不采用包内 ``source.version``。
+
+    写入在单连接事务内完成（提交/回滚由 get_db 统一处理），原子化。
+    目标 ID 非法返回 400 ``INVALID_ID``。
+    """
+    if not crud.valid_custom_id(ruleset_id):
+        return _error(
+            "INVALID_ID", "目标规则集 id 只能包含字母、数字、-、_", 400
+        )
+    try:
+        action, version, snapshot = crud.import_snapshot(
+            conn, ruleset_id, package.model_dump()
+        )
+    except crud.SnapshotPackageError as exc:
+        return _error(exc.code, exc.message, 400, details=exc.details)
+
+    if action == "created":
+        response.status_code = 201
+    return {
+        "action": action,
+        "ruleset_id": ruleset_id,
+        "version": version,
+        "source": package.source.model_dump(),
+        "digest": package.digest.model_dump(),
+        "snapshot": _version_out(snapshot),
+    }
 
 
 # ---------- 静态影响分析 ----------
